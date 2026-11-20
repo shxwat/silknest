@@ -1,4 +1,5 @@
 import AppKit
+import UniformTypeIdentifiers
 import ServiceManagement
 
 /// WEBBER's only window: shortcuts and a few switches. Everything takes effect immediately.
@@ -9,6 +10,9 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
     private var recorders: [ShortcutAction: ShortcutRecorder] = [:]
     private let pasteStatus = NSTextField(labelWithString:"")
     private let pasteButton = NSButton(title:"Enable…",target:nil,action:nil)
+    private let excludedPopup = NSPopUpButton()
+    private let removeExcluded = NSButton(title:"Remove",target:nil,action:nil)
+    private let excludedLabel = NSTextField(labelWithString:"Never catch from")
     var onChange: (() -> Void)?
 
     init(overlay: OverlayController) {
@@ -26,7 +30,7 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
     }
 
     private func build() {
-        let stack = NSStackView(); stack.orientation = .vertical; stack.alignment = .leading; stack.spacing = 14
+        let stack = NSStackView(); stack.orientation = .vertical; stack.alignment = .leading; stack.spacing = 12
         stack.edgeInsets = NSEdgeInsets(top:22,left:26,bottom:22,right:26)
         stack.addArrangedSubview(heading("Shortcuts"))
         let grid = NSGridView(); grid.rowSpacing = 10; grid.columnSpacing = 12
@@ -69,6 +73,13 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         stack.addArrangedSubview(toggle("Protect secrets (keys, tokens, codes, cards): masked, never saved, gone after 2 min",
                                         on:SecretGuard.protectSecrets,#selector(protectSecretsChanged(_:))))
         stack.addArrangedSubview(toggle("Never catch secrets at all",on:SecretGuard.neverCatchSecrets,#selector(neverCatchSecretsChanged(_:))))
+        let addExcluded = NSButton(title:"Add App…",target:self,action:#selector(addExcludedApp)); addExcluded.bezelStyle = .rounded
+        removeExcluded.target = self; removeExcluded.action = #selector(removeExcludedApp); removeExcluded.bezelStyle = .rounded
+        excludedPopup.widthAnchor.constraint(greaterThanOrEqualToConstant:200).isActive = true
+        excludedLabel.font = .systemFont(ofSize:13)
+        stack.addArrangedSubview(row([excludedLabel,excludedPopup,addExcluded,removeExcluded]))
+        stack.addArrangedSubview(note("Copies made in these apps are ignored. Also in the menu bar: Don't Catch from (the app in front)."))
+        refreshExcluded()
         let clear = NSButton(title:"Clear History…",target:self,action:#selector(clearHistory)); clear.bezelStyle = .rounded
         stack.addArrangedSubview(row([clear,note("Pinned items are kept.")]))
         stack.addArrangedSubview(note("Clipboard history, screenshots, OCR text and notes never leave your Mac."))
@@ -112,7 +123,54 @@ final class SettingsWindow: NSObject, NSWindowDelegate {
         pasteButton.isHidden = trusted
     }
 
-    func windowDidBecomeKey(_ notification: Notification) { refresh() }
+    #if DEBUG
+    /// Development only (--settings-preview): draws the window's content to a PNG without showing it.
+    func snapshot(to url: URL) {
+        refresh(); refreshExcluded()
+        guard let view = window.contentView else { return }
+        view.appearance = NSAppearance(named:.aqua); view.wantsLayer = true; view.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
+        view.layoutSubtreeIfNeeded()
+        let fit = view.fittingSize
+        print("SETTINGS fitting \(Int(fit.width))x\(Int(fit.height)) window \(Int(view.bounds.width))x\(Int(view.bounds.height))")
+        guard let rep = view.bitmapImageRepForCachingDisplay(in:view.bounds) else { return }
+        view.cacheDisplay(in:view.bounds,to:rep)
+        try? rep.representation(using:.png,properties:[:])?.write(to:url)
+    }
+    #endif
+
+    func windowDidBecomeKey(_ notification: Notification) { refresh(); refreshExcluded() }
+
+    /// The excluded apps, by name; the menu bar can change the list while this window is open.
+    func refreshExcluded() {
+        let ids = ExcludedApps.bundleIDs()
+        excludedPopup.removeAllItems()
+        if ids.isEmpty {
+            excludedPopup.addItem(withTitle:"No apps"); excludedPopup.isEnabled = false
+        } else {
+            for id in ids {
+                excludedPopup.addItem(withTitle:ExcludedApps.displayName(id))
+                excludedPopup.lastItem?.representedObject = id
+            }
+            excludedPopup.isEnabled = true
+        }
+        removeExcluded.isEnabled = !ids.isEmpty
+        excludedLabel.stringValue = ids.count > 1 ? "Never catch from (\(ids.count) apps)" : "Never catch from"
+    }
+    @objc private func addExcludedApp() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.applicationBundle]; panel.allowsMultipleSelection = true
+        panel.canChooseDirectories = false; panel.directoryURL = URL(fileURLWithPath:"/Applications")
+        panel.prompt = "Don't Catch"; panel.message = "Choose apps whose copies SilkNest should ignore."
+        panel.beginSheetModal(for:window) { [weak self] response in
+            guard response == .OK, let self else { return }
+            for url in panel.urls { if let id = ExcludedApps.bundleID(ofAppAt:url), id != Bundle.main.bundleIdentifier { ExcludedApps.add(id) } }
+            self.refreshExcluded()
+        }
+    }
+    @objc private func removeExcludedApp() {
+        guard let id = excludedPopup.selectedItem?.representedObject as? String else { return }
+        ExcludedApps.remove(id); refreshExcluded()
+    }
 
     @objc private func resetShortcut(_ sender: NSButton) { ShortcutAction.allCases[sender.tag].reset(); apply() }
     @objc private func returnChanged(_ sender: NSPopUpButton) {

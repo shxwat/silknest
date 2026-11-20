@@ -18,7 +18,7 @@ enum DevFlags {
     static func env(_ key: String) -> String? { enabled ? ProcessInfo.processInfo.environment[key] : nil }
 }
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var overlay: OverlayController?
     private var statusItem: NSStatusItem?
     private var study: SpiderStudy?
@@ -28,6 +28,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var historyItem: NSMenuItem?, loginItem: NSMenuItem?
     private var notesItem: NSMenuItem?, clearStackItem: NSMenuItem?
     private var pauseItem: NSMenuItem?, hideItem: NSMenuItem?, webItem: NSMenuItem?
+    private var excludeItem: NSMenuItem?
+    /// The app that was in front when the menu opened (the menu itself never takes focus from it).
+    private var excludeTarget: (id: String, name: String)?
     private let developmentMode = DevFlags.has("--study")
     /// Someone who used SilkNest before this launch (the welcome is marked as shown during launch).
     private let existingUser = UserDefaults.standard.bool(forKey:"welcomed")
@@ -73,6 +76,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         huntItem = add("Catch Every Copy",#selector(toggleHunt))
         huntItem?.state = overlay.huntMode ? .on : .off
         hideItem = add("Hide Spider",#selector(hide))
+        excludeItem = add("Don't Catch from This App",#selector(toggleExcludeFrontmost))
         clearStackItem = add("Clear Paste Stack",#selector(clearStack))
         // Menu hints follow the user's own shortcuts (display only; the overlay registers the real ones).
         for (action,item) in shortcutItems {
@@ -94,8 +98,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         _ = add("Settings…",#selector(openSettings),",")
         menu.addItem(.separator())
         _ = add("Quit SilkNest",#selector(quit),"q")
+        menu.delegate = self
         item.menu = menu; statusItem = item
         if developmentMode { showStudy() }
+        #if DEBUG
+        if let out = DevFlags.value("--settings-preview=") {
+            let window = SettingsWindow(overlay:overlay); window.snapshot(to:URL(fileURLWithPath:out))
+            if let menu = statusItem?.menu, let entry = excludeItem {
+                let d = UserDefaults.standard; let before = d.stringArray(forKey:ExcludedApps.key)
+                menuWillOpen(menu)
+                print("MENU front=\(NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? "-") title=\(entry.title) hidden=\(entry.isHidden) state=\(entry.state.rawValue)")
+                if !entry.isHidden {
+                    toggleExcludeFrontmost(); menuWillOpen(menu)
+                    print("MENU after toggle: state=\(entry.state.rawValue) list=\(ExcludedApps.bundleIDs())")
+                    toggleExcludeFrontmost(); menuWillOpen(menu)
+                    print("MENU after 2nd toggle: state=\(entry.state.rawValue) list=\(ExcludedApps.bundleIDs())")
+                }
+                d.set(before,forKey:ExcludedApps.key)
+            }
+            NSApp.terminate(nil); return
+        }
+        #endif
         if DevFlags.has("--automation") { startAutomation() }
         Updater.shared.willRelaunch = { [weak overlay] in
             guard let overlay else { return }
@@ -147,6 +170,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             study?.onClose = { [weak self] in self?.study = nil }
         }
         study?.show()
+    }
+    /// "Don't Catch from Safari": names the app in front, ticked when it is already excluded.
+    func menuWillOpen(_ menu: NSMenu) {
+        let front = NSWorkspace.shared.frontmostApplication
+        if let front, let id = front.bundleIdentifier, id != Bundle.main.bundleIdentifier, !SecretGuard.fromPasswordManager(id) {
+            let name = front.localizedName ?? ExcludedApps.displayName(id)
+            excludeTarget = (id,name)
+            excludeItem?.title = "Don't Catch from \(name)"
+            excludeItem?.state = ExcludedApps.contains(id) ? .on : .off
+            excludeItem?.isHidden = false
+        } else {
+            excludeTarget = nil; excludeItem?.isHidden = true
+        }
+    }
+    @objc private func toggleExcludeFrontmost() {
+        guard let target = excludeTarget else { return }
+        ExcludedApps.toggle(target.id)
+        settings?.refreshExcluded()
     }
     @objc private func newNote() { overlay?.notes.compose() }
     @objc private func clearStack() { overlay?.clearStack(); refreshMenu() }

@@ -93,10 +93,16 @@ final class ClipboardController {
         guard shouldCatch(NSWorkspace.shared.frontmostApplication) else { return (nil,nil) }
         // Never auto-catch from a password manager. A detected secret is caught masked and memory-only
         // (protectSecrets; "never catch secrets" refuses it in catchCurrent); other memory-only copies are skipped.
-        guard !SecretGuard.fromPasswordManager(NSWorkspace.shared.frontmostApplication?.bundleIdentifier) else { return (nil,nil) }
+        guard !Self.huntSkips(frontmost:NSWorkspace.shared.frontmostApplication?.bundleIdentifier) else { return (nil,nil) }
         guard case .caught(let item) = catchCurrent(board), !item.neverPersist || item.isSecret else { return (nil,nil) }
         if let old = existing(item) { promote(old); return (nil,old) }
         return (item,nil)
+    }
+
+    /// Hunt never reads a copy made in a password manager or in an app the user excluded
+    /// (Settings or the menu bar); the pasteboard is not even opened.
+    static func huntSkips(frontmost bundleID: String?, _ defaults: UserDefaults = .standard) -> Bool {
+        SecretGuard.fromPasswordManager(bundleID) || ExcludedApps.contains(bundleID,defaults)
     }
 
     /// A screenshot saved as a file, caught as an image (the original bytes are what Copy Again restores).

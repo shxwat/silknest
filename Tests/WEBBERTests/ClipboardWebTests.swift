@@ -659,6 +659,33 @@ final class ClipboardWebChecks {
         check(!leaked,"no sensitive bytes on disk")
     }
 
+    func testExcludedApps() {
+        let name = "studio.webber.tests.excluded.\(ProcessInfo.processInfo.processIdentifier)"
+        guard let d = UserDefaults(suiteName:name) else { check(false,"defaults suite"); return }
+        defer { d.removePersistentDomain(forName:name) }
+        check(ExcludedApps.bundleIDs(d).isEmpty,"nothing excluded by default")
+        check(!ClipboardController.huntSkips(frontmost:"com.apple.Safari",d),"ordinary app is caught")
+        check(ClipboardController.huntSkips(frontmost:"com.1password.1password",d),"password manager always skipped")
+        check(!ClipboardController.huntSkips(frontmost:nil,d) && !ExcludedApps.contains("",d),"no frontmost app → caught")
+        ExcludedApps.add("com.apple.Safari",d); ExcludedApps.add("com.apple.Safari",d); ExcludedApps.add("",d)
+        check(ExcludedApps.bundleIDs(d) == ["com.apple.Safari"],"added once, empty ignored")
+        check(ClipboardController.huntSkips(frontmost:"com.apple.Safari",d),"excluded app skipped")
+        check(!ClipboardController.huntSkips(frontmost:"com.apple.Notes",d),"other apps still caught")
+        ExcludedApps.toggle("com.apple.Notes",d)
+        check(ExcludedApps.bundleIDs(d) == ["com.apple.Safari","com.apple.Notes"],"toggle adds, order kept")
+        ExcludedApps.toggle("com.apple.Safari",d)
+        check(ExcludedApps.bundleIDs(d) == ["com.apple.Notes"] && !ClipboardController.huntSkips(frontmost:"com.apple.Safari",d),"toggle removes")
+        ExcludedApps.remove("com.apple.Notes",d)
+        check(ExcludedApps.bundleIDs(d).isEmpty,"remove")
+        // Survives a restart: a fresh read of the same preferences sees the list.
+        ExcludedApps.add("com.tinyspeck.slackmacgap",d)
+        check(UserDefaults(suiteName:name)?.stringArray(forKey:ExcludedApps.key) == ["com.tinyspeck.slackmacgap"],"persisted")
+        check(ExcludedApps.displayName("com.example.not-installed") == "com.example.not-installed","unknown app shows its id")
+        check(ExcludedApps.displayName("com.apple.finder") == "Finder","installed app shows its name")
+        check(ExcludedApps.bundleID(ofAppAt:URL(fileURLWithPath:"/System/Applications/TextEdit.app")) == "com.apple.TextEdit","app bundle → id")
+        check(ExcludedApps.bundleID(ofAppAt:URL(fileURLWithPath:"/System/Library/CoreServices/SystemVersion.plist")) == nil,"non-app → nil")
+    }
+
     func testTransformsOnlyWhenUseful() {
         func titles(_ s: String) -> Set<String> { Set(TextTransform.applicable(to:s).map(\.title)) }
         check(titles("hello world") == ["UPPERCASE","Title Case"],"plain lowercase sentence")
@@ -846,13 +873,14 @@ struct ClipboardWebCheckRunner {
         suite.testCorruptHistoryStartsEmptyWithoutCrashing()
         suite.testSensitiveClipboardIsNeverCaught()
         suite.testTransformsOnlyWhenUseful()
+        suite.testExcludedApps()
         suite.testSecretsAndEncryptionAtRest()
         suite.testSilkNotesStore()
         suite.testNoteVisibilityResolver()
         suite.testNoteDisplayFallbackAndPinPersistence()
         suite.testShortcutConflictDetection()
         suite.testSilkRailResolver()
-        print("33 clipboard/web checks; \(suite.failures) failures")
+        print("34 clipboard/web checks; \(suite.failures) failures")
         exit(suite.failures == 0 ? 0 : 1)
     }
 }

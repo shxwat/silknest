@@ -48,7 +48,7 @@ swiftc -swift-version 5 "$T"/old/*.swift -o "$T/old-writer" 2>/dev/null
 ls "$T/data/History" | grep -q '^index.enc$' || { echo "FAIL 1.2.2 did not write its single index"; exit 1; }
 
 NEW_FILES=(Spider/MotionMath.swift Clipboard/ClipboardItem.swift Clipboard/PasteboardReader.swift Clipboard/ClipboardController.swift
-  Clipboard/ItemPreview.swift Clipboard/HistoryStore.swift App/AppData.swift App/BuildFlavor.swift Clipboard/SecretGuard.swift
+  Clipboard/ItemPreview.swift Clipboard/HistoryStore.swift App/AppData.swift App/BuildFlavor.swift Clipboard/SecretGuard.swift Clipboard/ExcludedApps.swift
   Clipboard/SecretDetector.swift Notes/SilkNote.swift Notes/NoteVisibility.swift Notes/SilkRailResolver.swift)
 for f in $NEW_FILES; do cp "Sources/WEBBER/$f" "$T/new/${f:t}"; done
 cat > "$T/new/main.swift" <<'SWIFT'

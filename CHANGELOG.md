@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.3.1
+
+**Exclude apps**
+- Choose apps SilkNest should never catch from: Settings → Never catch from → Add App…
+- Or from the menu bar: "Don't Catch from Safari" (it names whichever app is in front). Click it again to catch from that app again.
+- Copies made in an excluded app aren't read at all. Catch Copy (spider menu or its shortcut) and dropping onto the spider still work there, because you ask for them on purpose.
+- Only the apps' identifiers are kept, in SilkNest's own settings. Password managers are skipped as before, without being on the list.
+
 ## 1.3.0
 
 **A smaller, smarter Nest**

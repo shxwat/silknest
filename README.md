@@ -2,6 +2,21 @@
 
 **A clipboard manager for Mac with a spider. Everything stays on your Mac.**
 
+[![Latest release](https://img.shields.io/github/v/release/shxwat/silknest?label=release&color=f2b33d)](https://github.com/shxwat/silknest/releases/latest)
+![macOS 14+](https://img.shields.io/badge/macOS-14%2B-0d1b36)
+![Apple silicon](https://img.shields.io/badge/Apple%20silicon-arm64-0d1b36)
+[![License: GPL-3.0](https://img.shields.io/badge/license-GPL--3.0-2b6cb0)](LICENSE)
+![Price: free](https://img.shields.io/badge/price-free-2f9e5b)
+
+> [!IMPORTANT]
+> **Your clipboard is yours.**
+> - 🔒 **Stays on your Mac.** History, screenshots, text read from images and notes never leave it. No account, no cloud sync, no ads.
+> - 🛡️ **Encrypted on disk.** AES-256-GCM with a key made on your Mac; owner-only and kept out of Time Machine.
+> - 🙈 **Secrets are never saved.** Password-manager and concealed copies are never written to disk. API keys, tokens, card numbers and one-time codes (also inside screenshots) are masked, kept in memory only and gone after two minutes.
+> - 🚫 **You decide what's caught.** Password managers are always skipped, and you can exclude any other app.
+> - 🌐 **One network call only:** the update check to `silknest.app`. It sends nothing about you or your clipboard, and you can turn it off.
+> - 🆓 **Free and open source** (GPL-3.0): read every line of what runs on your Mac.
+
 A small 3D spider lives on your desktop. Copy anything — text, links, code, files, images, screenshots —
 and it catches it, wraps it in silk and carries it to its nest in the corner. Press **⇧⌘Space** and the
 Nest spreads out with everything you copied; pick something and it is pasted where you were typing.
@@ -21,6 +36,8 @@ Nest spreads out with everything you copied; pick something and it is pasted whe
 - **Secret protection** — API keys and tokens, private keys, card numbers and one-time codes are
   recognised in copied text *and inside screenshots*. They're kept in memory only, shown masked or
   blurred, and disappear after two minutes.
+- **Exclude apps** — pick apps whose copies the spider ignores (Settings, or "Don't Catch from …" in
+  the menu bar). Password managers are always skipped.
 - **Silk Notes** — quick notes that hang from the top of your screen on silk threads (⌥N). Write a time
   ("in 20 min", "at 4 pm") for a reminder with Snooze and Done, use `[ ]` for checklists, right-click
   for more; notes are found by Nest search too.
