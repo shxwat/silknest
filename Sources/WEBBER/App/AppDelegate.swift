@@ -41,6 +41,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if DevFlags.has("--sprite-sheet") { PreviewCapture.spriteSheet(); NSApp.terminate(nil); return }
         if DevFlags.has("--app-icon") { PreviewCapture.appIcon(); NSApp.terminate(nil); return }
         if DevFlags.has("--render-preview") { PreviewCapture.run(); NSApp.terminate(nil); return }
+        #if DEBUG
+        if let dir = DevFlags.value("--beauty=") { BeautyCapture.run(dir); NSApp.terminate(nil); return }
+        #endif
         // One spider only: if WEBBER is already running (e.g. opened twice, or a login item plus a manual
         // launch), this copy quits instead of adding a second overlay.
         let me = NSRunningApplication.current

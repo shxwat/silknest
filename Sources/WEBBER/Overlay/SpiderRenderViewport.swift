@@ -10,7 +10,8 @@ enum SpiderRenderViewport {
     /// motion stay exactly in desktop coordinates. tan(25°).
     static var tilt: Float = 0.466
     static func compact(around point: CGPoint, in display: CGRect, scale: CGFloat, backingScale: CGFloat) -> CGRect {
-        let side = max(640,512*scale)
+        // Big enough for the spider, its sleeping thread and a catch; it re-centres as the spider walks.
+        let side = max(480,384*scale)
         let alignedSide = (side*backingScale).rounded(.up)/backingScale
         let size = CGSize(width:min(alignedSide,display.width),height:min(alignedSide,display.height))
         let x = min(max(point.x-size.width/2,display.minX),display.maxX-size.width)

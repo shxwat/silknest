@@ -39,7 +39,7 @@ final class OverlayController {
     let nestMarker: NestMarker
     /// The spider's render view. Replaced by an unattached placeholder while the spider is hidden, so its
     /// GPU resources are released; rebuilt when it is shown again.
-    private var sceneView: ClearSceneView
+    private var sceneView: SpiderSurface
     private let webView: ClearSceneView
     private let effects: SilkEffectsLayer
     private let sequence: CatchSequence
@@ -51,7 +51,11 @@ final class OverlayController {
     private var notesBusy = false
     let shortcuts = ShortcutManager()
     private var displayLink: DisplayLinkProxy?
-    private let renderBridge: SpiderRenderBridge
+    /// The spider's surface needs one more draw (a new tile, camera, or a draw that found no drawable).
+    private var surfaceDirty = true
+    private var renderRateNow = 0
+    /// Development stats: frames drawn and the longest gap between two drawn frames while drawing.
+    private var drawStats = (frames:0,longestGap:0.0,last:0.0)
     private var watchdog: Timer?
     private var lastPoseTime: CFTimeInterval = 0
     private var lastWebChange: CFTimeInterval = 0
@@ -93,6 +97,8 @@ final class OverlayController {
     private var nestOutsideMonitor: Any?
     private var pointerMonitors: [Any] = []
     private var engagedNear = false
+    /// Development only (automation "pointer:off"): measurements ignore the real pointer.
+    private var ignorePointer = false
     private var traceLeft = 0
     private var trace: [String] = []
     private var screenObserver: Any?
@@ -193,7 +199,8 @@ final class OverlayController {
         webView = ClearSceneView(frame:NSRect(origin:.zero,size:space.compactWebSize))
         webView.scene = web.scene; webView.pointOfView = web.camera; webView.backgroundColor = .clear; webView.rendersContinuously = false
         webView.autoresizingMask = [.width,.height]
-        webPanel.contentView = webView
+        // The Nest's view joins its window only while the Nest is open (see showWebPanel).
+        webPanel.contentView = NSView(frame:NSRect(x:0,y:0,width:1,height:1))
 
         renderer = SpiderRenderer(size:screen.frame.size,species:species)
         // Keep the desktop panel fixed for planted feet, but allocate GPU buffers only for the
@@ -207,23 +214,20 @@ final class OverlayController {
         renderer.camera.simdPosition = renderCamera.position
         panel = Self.makePanel(frame:screen.frame)
         panel.ignoresMouseEvents = true
-        sceneView = ClearSceneView(frame:renderFrame)
+        sceneView = SpiderSurface(frame:renderFrame)
         sceneView.scene = renderer.scene; sceneView.pointOfView = renderer.camera
-        sceneView.backgroundColor = .clear
+        sceneView.warmUp()
         switch DevFlags.env("WEBBER_MSAA") {
-        case "0": sceneView.antialiasingMode = .none
-        case "2": sceneView.antialiasingMode = .multisampling2X
-        default: sceneView.antialiasingMode = Self.antialiasing(for:screen)
+        case "0": sceneView.setSamples(for:.none)
+        case "2": sceneView.setSamples(for:.multisampling2X)
+        default: sceneView.setSamples(for:Self.antialiasing(for:screen))
         }
-        sceneView.preferredFramesPerSecond = 120; sceneView.rendersContinuously = false
         let renderHost = NSView(frame:NSRect(origin:.zero,size:renderSize))
         renderHost.layer = CALayer(); renderHost.wantsLayer = true
         renderHost.layer?.backgroundColor = NSColor.clear.cgColor
         renderHost.addSubview(sceneView)
         panel.contentView = renderHost
         panel.level = NSWindow.Level(rawValue:webPanel.level.rawValue+2)
-        renderBridge = SpiderRenderBridge(renderer:renderer)
-        sceneView.delegate = renderBridge
 
         webInteractionPanel = Self.makePanel(frame:space.visibleScreenFrame)
         webInteractionPanel.level = NSWindow.Level(rawValue:webPanel.level.rawValue+1)
@@ -265,7 +269,16 @@ final class OverlayController {
         // frame-loop tick: an idle loop runs at 10 Hz, and a click inside that gap would fall through to
         // the app underneath (e.g. switching a browser tab instead of grabbing a note).
         let onMove: (NSEvent) -> Void = { [weak self] _ in
-            guard let self, CACurrentMediaTime()-self.lastTime > 0.004 else { return }
+            if self?.ignorePointer == true { return }
+            guard let self else { return }
+            let since = CACurrentMediaTime()-self.lastTime
+            guard since > 0.004 else { return }
+            // Resting, with the pointer far from the spider: hit areas still follow within 1/30 s (no click can
+            // fall through), but moving the mouse across the screen no longer runs the loop at mouse rate.
+            if (self.displayLink?.currentRate ?? 0) <= Self.restRate && since < 1.0/30 {
+                let pointer = NSEvent.mouseLocation, spider = self.space.screen(motion:self.motion.position)
+                if hypot(pointer.x-spider.x,pointer.y-spider.y) > 360 { return }
+            }
             self.tick()
         }
         pointerMonitors = [
@@ -857,34 +870,38 @@ final class OverlayController {
 
     // MARK: frame loop
 
+    /// The resting loop: only the clipboard check (every 0.25 s) and clocks need it. Pointer moves wake the
+    /// loop on their own (the mouse monitors call tick), so the spider still notices you at once.
+    static let restRate: Float = 4
+
     private static let movingStates: Set<SpiderState> = [.anticipating,.crawling,.turning,.alert,.orienting,.tracking,.catching,.settling,.held]
 
     private func setRenderViewport(_ rect: CGRect) {
         guard rect != sceneView.frame else { return }
         let camera = SpiderRenderViewport.camera(for:rect,in:CGRect(origin:.zero,size:space.screenFrame.size),scale:spiderScale)
-        renderBridge.setCamera(position:camera.position,scale:camera.extent,projection:camera.projection)
+        applyCamera(camera)
         sceneView.frame = rect
-        renderer.forceNextRender()
-        sceneView.setNeedsDisplay(sceneView.bounds)
+        renderer.forceNextRender(); surfaceDirty = true
     }
 
     private func updateRenderViewport(now: CFTimeInterval) {
         let display = CGRect(origin:.zero,size:space.screenFrame.size)
         let point = space.desk(motion:motion.position)
         // Dragging can cross the whole display in one event; expand before showing that pose.
-        // During ordinary patrol the tile stays fixed, rather than following the spider each frame.
+        // Walking, the small tile simply re-centres on the spider when it nears an edge (same size, so no
+        // buffers are reallocated): a full-display surface would cost ~10× the memory and fill rate.
         let required = SpiderRenderViewport.required(around:point,in:display,scale:spiderScale)
-        if motion.state == .held || !sceneView.frame.contains(required) {
-            setRenderViewport(display)
-        } else if sceneView.frame == display && motion.state == .idle && !sequence.isActive && now-lastPoseTime > 0.5 {
-            let backing = panel.screen?.backingScaleFactor ?? 2
+        let backing = panel.screen?.backingScaleFactor ?? 2
+        if motion.state == .held {
+            if sceneView.frame != display { setRenderViewport(display) }
+        } else if !sceneView.frame.contains(required) || (sceneView.frame == display && !sequence.isActive && now-lastPoseTime > 0.5) {
             setRenderViewport(SpiderRenderViewport.compact(around:point,in:display,scale:spiderScale,backingScale:backing))
         }
     }
 
     /// The fallback protects vsync delivery; the idle run-loop timer already drives itself reliably.
     private func updateWatchdog() {
-        guard (displayLink?.currentRate ?? 120) > 10 else {
+        guard (displayLink?.currentRate ?? 120) > Self.restRate else {
             watchdog?.invalidate(); watchdog = nil; return
         }
         guard watchdog == nil else { return }
@@ -907,12 +924,13 @@ final class OverlayController {
         // Notes live independently of the spider (they stay even when the spider is hidden).
         notesBusy = notes.tick(dt:CGFloat(dt))
         guard visible else {
-            displayLink?.setRate(notesBusy || notes.isComposing ? 120 : 10)
+            displayLink?.setRate(notesBusy || notes.isComposing ? 120 : Self.restRate)
             updateWatchdog()
             return
         }
         if DevFlags.has("--web-check") && !webCheckStarted && motion.time > 0.35 { webCheckStarted = true; startWebCheck() }
-        let cursor = space.motion(screen:NSEvent.mouseLocation)
+        // Development measurements (automation "pointer:off") run as if the pointer were far away.
+        let cursor = ignorePointer ? V3(-100000,-100000,0) : space.motion(screen:NSEvent.mouseLocation)
         if let verification { verification.update(dt:dt) }
         else if !motion.paused {
             nativeDragActive = dragAwareness.update()
@@ -966,9 +984,19 @@ final class OverlayController {
         // SceneKit only redraws on its own when the graph changes, so the view renders continuously while
         // poses are arriving and stops a moment after the spider is still (no idle GPU work).
         updateRenderViewport(now:now)
-        if renderer.needsRender(motion) { renderBridge.submit(SpiderPoseSnapshot(motion)); lastPoseTime = now }
+        // Drawn right here, only when the pose (or the tile) changed: nothing else ever wakes the GPU.
+        if renderer.needsRender(motion) || surfaceDirty {
+            sceneView.waitForGPU()
+            renderer.render(motion)
+            if sceneView.draw() {
+                surfaceDirty = false
+                drawStats.frames += 1
+                if drawStats.last > 0 && now-drawStats.last < 0.25 { drawStats.longestGap = max(drawStats.longestGap,now-drawStats.last) }
+                drawStats.last = now
+            } else { surfaceDirty = true }
+            lastPoseTime = now
+        }
         let animating = now-lastPoseTime < 0.3
-        if sceneView.rendersContinuously != animating { sceneView.rendersContinuously = animating }
         // Energy: full rate only for real motion. Idle micro-movements (breathing, a palp twitch) render at
         // 60 fps (smooth on ProMotion), and with nothing moving at all the loop itself drops to 10 Hz.
         // "Busy" means something is actually moving; paused or quietly watching is not.
@@ -980,11 +1008,12 @@ final class OverlayController {
             || dropView.isPressed || nativeDragActive
         let loopBusy = busy || notesBusy || notes.isComposing
         // 120 fps only when the user is looking at it or using it; a spider strolling on its own runs at 60.
-        let interactive = engagedNear || motion.dragActive || sequence.isActive || web.isExpandedAtAll || menu.isOpen || dropView.isPressed || nativeDragActive
+        // A catch runs at 60 fps unless the pointer is right there too (it is quick, and 60 is smooth for it).
+        let interactive = engagedNear || motion.dragActive || web.isExpandedAtAll || menu.isOpen || dropView.isPressed || nativeDragActive
         let renderRate = busy ? (interactive ? 120 : (motion.state == .crawling || motion.state == .turning) && !sequence.isActive ? 30 : 60) : (animating ? 60 : 2)
-        if sceneView.preferredFramesPerSecond != renderRate { sceneView.preferredFramesPerSecond = renderRate }
+        renderRateNow = renderRate
         displayLink?.setRate(loopBusy ? (interactive || notesBusy || notes.isComposing ? 120 : renderRate == 30 ? 30 : 60)
-                             : (animating || webPanelShown || menu.isOpen ? 60 : 10))
+                             : (animating || webPanelShown || menu.isOpen ? 60 : Self.restRate))
         updateWatchdog()
         // The Nest's 3D view sleeps entirely while the Nest is folded away.
         let nestRate = webPanelShown ? 120 : 2
@@ -1003,9 +1032,13 @@ final class OverlayController {
         let radius = dragging ? CGFloat(motion.awarenessRadius)*space.spiderScale : 90
         if receiver.frame.width != radius*2 { receiver.setContentSize(NSSize(width:radius*2,height:radius*2)) }
         let hitOrigin = NSPoint(x:p.x-radius,y:p.y-radius)
-        if receiver.frame.origin != hitOrigin { receiver.setFrameOrigin(hitOrigin) }
         let pointer = NSEvent.mouseLocation
         let distance = hypot(pointer.x-p.x,pointer.y-p.y)
+        // The click target only has to be under the spider when the pointer could reach it: moving a window is a
+        // WindowServer round-trip, so a walking spider no longer drags it along every frame while you're elsewhere.
+        if receiver.frame.origin != hitOrigin && (dragging || motion.state == .held || dropView.isPressed || distance < radius+240) {
+            receiver.setFrameOrigin(hitOrigin)
+        }
         let held = motion.state == .held || dropView.isPressed
         let passThrough = held ? false : (dragging ? distance > radius-2 : (distance > clickRadius || menu.isOpen))
         if receiver.ignoresMouseEvents != passThrough { receiver.ignoresMouseEvents = passThrough }
@@ -1063,9 +1096,8 @@ final class OverlayController {
         let here = space.screen(motion:motion.position)
         let fresh = SpiderRenderer(size:screen.frame.size,species:next)
         fresh.lock = renderer.lock
-        renderBridge.replaceRenderer(fresh)
         renderer = fresh; sequence.renderer = fresh
-        sceneView.scene = fresh.scene; sceneView.pointOfView = fresh.camera
+        sceneView.scene = fresh.scene; sceneView.pointOfView = fresh.camera; surfaceDirty = true; sceneView.warmUp()
         motion.cruiseSpeed = next.speed; motion.acceleration = next.acceleration; motion.gaitTempo = next.gaitTempo
         // New size: re-map the same desktop spot into the new motion scale.
         retarget(to:screen,spiderAt:here)
@@ -1090,9 +1122,9 @@ final class OverlayController {
         let renderFrame = motion.state == .held ? display : SpiderRenderViewport.compact(around:space.desk(motion:motion.position),
             in:display,scale:spiderScale,backingScale:screen.backingScaleFactor)
         sceneView.frame = renderFrame
-        if DevFlags.env("WEBBER_MSAA") == nil { sceneView.antialiasingMode = Self.antialiasing(for:screen) }
+        if DevFlags.env("WEBBER_MSAA") == nil { sceneView.setSamples(for:Self.antialiasing(for:screen)) }
         let renderCamera = SpiderRenderViewport.camera(for:renderFrame,in:display,scale:spiderScale)
-        renderBridge.setCamera(position:renderCamera.position,scale:renderCamera.extent,projection:renderCamera.projection)
+        applyCamera(renderCamera)
         nestMarker.retarget(screen); effects.retarget(screen); stackMarker.retarget(screen)
         layoutNest(on:screen)
         renderer.forceNextRender()
@@ -1142,6 +1174,8 @@ final class OverlayController {
         let origin = nestSpace.desk(screen:frame.origin)
         let viewport = CGRect(x:origin.x-nestSpace.webOrigin.x,y:origin.y-nestSpace.webOrigin.y,width:frame.width,height:frame.height)
         if shown {
+            // Back in its window only while open: a windowless SCNView runs no display link of its own.
+            if webPanel.contentView !== webView { webPanel.contentView = webView }
             webView.scene = web.scene; webView.pointOfView = web.camera
             // Two drawables instead of three: the web only redraws while it moves, so double buffering
             // is enough, and each drawable is a full Retina surface of the Nest area.
@@ -1158,6 +1192,7 @@ final class OverlayController {
         bindWebInteraction()
         if !shown {
             webView.scene = nil
+            webPanel.contentView = NSView(frame:NSRect(x:0,y:0,width:1,height:1))
             nestBackdrop.setFrame(frame,display:false)
             for item in web.items { web.discard(item.id) }
         }
@@ -1192,8 +1227,8 @@ final class OverlayController {
         guard sceneView.superview != nil else { return }
         displayLink?.invalidate()
         displayLink = DisplayLinkProxy(view:nil) { [weak self] in self?.tick() }
-        sceneView.delegate = nil; sceneView.scene = nil; sceneView.removeFromSuperview()
-        sceneView = ClearSceneView(frame:NSRect(x:0,y:0,width:1,height:1))
+        sceneView.scene = nil; sceneView.releaseBuffers(); sceneView.removeFromSuperview()
+        sceneView = SpiderSurface(frame:NSRect(x:0,y:0,width:1,height:1))
         updateWatchdog()
     }
 
@@ -1201,19 +1236,25 @@ final class OverlayController {
         let screen = NSScreen.screens.first { $0.frame == space.screenFrame } ?? NSScreen.main!
         let display = CGRect(origin:.zero,size:space.screenFrame.size)
         let rect = SpiderRenderViewport.compact(around:space.desk(motion:motion.position),in:display,scale:spiderScale,backingScale:screen.backingScaleFactor)
-        let view = ClearSceneView(frame:rect)
-        view.scene = renderer.scene; view.pointOfView = renderer.camera; view.backgroundColor = .clear
-        view.antialiasingMode = Self.antialiasing(for:screen)
-        view.preferredFramesPerSecond = 120; view.rendersContinuously = false
-        view.delegate = renderBridge
+        let view = SpiderSurface(frame:rect)
+        view.scene = renderer.scene; view.pointOfView = renderer.camera; view.warmUp()
+        view.setSamples(for:Self.antialiasing(for:screen))
         panel.contentView?.addSubview(view)
         sceneView = view
         let camera = SpiderRenderViewport.camera(for:rect,in:display,scale:spiderScale)
-        renderBridge.setCamera(position:camera.position,scale:camera.extent,projection:camera.projection)
-        renderer.forceNextRender()
+        applyCamera(camera)
+        renderer.forceNextRender(); surfaceDirty = true
         displayLink?.invalidate()
         displayLink = DisplayLinkProxy(view:view) { [weak self] in self?.tick() }
         updateWatchdog()
+    }
+
+    /// The camera for the current render tile (main thread, applied to the next draw).
+    private func applyCamera(_ camera: (position: V3, extent: Double, projection: SCNMatrix4)) {
+        renderer.camera.simdPosition = camera.position
+        renderer.camera.camera?.orthographicScale = camera.extent
+        renderer.camera.camera?.projectionTransform = camera.projection
+        surfaceDirty = true
     }
 
     func demoCatch() { _ = motion.catchItem(at:motion.world(V3(0,55,0))) }
@@ -1241,7 +1282,7 @@ final class OverlayController {
             "notes":notes.automationState(),
             "rails":notes.automationRails(),
             "shortcutsActive":activeShortcuts.keys.map(\.rawValue).sorted(),
-            "frames":["count":frameStats.count,"longestGapMs":frameStats.longest*1000,"lateOver12ms":frameStats.late,"worstTickMs":frameStats.tickCost*1000,"slowTicksOver4ms":slowTicks,"meanTickMs":tickTotal/Double(max(1,frameStats.count))*1000,"posesRendered":renderBridge.applied,"longestRenderGapMs":renderBridge.longestApplyGap*1000],
+            "frames":["count":frameStats.count,"longestGapMs":frameStats.longest*1000,"lateOver12ms":frameStats.late,"worstTickMs":frameStats.tickCost*1000,"slowTicksOver4ms":slowTicks,"meanTickMs":tickTotal/Double(max(1,frameStats.count))*1000,"posesRendered":drawStats.frames,"longestRenderGapMs":drawStats.longestGap*1000,"drawMsTotal":sceneView.drawMs],
             "spider":["state":motion.state.rawValue,"x":Double(motion.position.x),"y":Double(motion.position.y),"paused":motion.paused],
             "sequence":sequence.phase?.rawValue ?? "none",
             "lastCatchMode":sequence.lastMode?.rawValue ?? "none",
@@ -1254,7 +1295,7 @@ final class OverlayController {
             "shortcutFailures":lastShortcutFailures,
             "trusted":PasteAssist.trusted,
             "loopRate":displayLink?.currentRate ?? 0,
-            "sceneFPS":sceneView.preferredFramesPerSecond,
+            "sceneFPS":renderRateNow,
             "spiderState":motion.state.rawValue,
             "stackCount":stack.count,
             "nestItems":web.items.map { ["id":$0.id,"x":Double(nestSpace.screen(web:web.objectCenter($0)).x),"y":Double(nestSpace.screen(web:web.objectCenter($0)).y)] },
@@ -1325,7 +1366,7 @@ final class OverlayController {
         case "settings": onOpenSettings?()
         case "stack" where parts.count == 2: if let i = Int(parts[1]), clipboard.items.indices.contains(i) { addToStack(clipboard.items[i]) }
         case "trace": traceLeft = 240
-        case "resetStats": frameStats = (0,0,0,0); slowTicks = 0; tickTotal = 0; renderBridge.resetStats()
+        case "resetStats": frameStats = (0,0,0,0); slowTicks = 0; tickTotal = 0; drawStats = (0,0,0)
         case "walk": motion.autoPatrol = false; motion.crawl(to:motion.constrain(motion.position+V3(-420,180,0)))
         case "walkBack": motion.crawl(to:motion.constrain(motion.position+V3(420,-180,0)))
         case "catch": catchClipboard()
@@ -1398,6 +1439,7 @@ final class OverlayController {
         case "wiggle": motion.happyWiggle()
         case "reduceMotion" where parts.count == 2: motion.reduceMotion = parts[1] == "on"; sequence.reduceMotion = motion.reduceMotion
         case "nestOnSpider" where parts.count == 2: nestFollowsSpider = parts[1] == "on"
+        case "pointer" where parts.count == 2: ignorePointer = parts[1] == "off"
         case "visible" where parts.count == 2: visible = parts[1] == "on"; onStateChange?()
         case "testclip" where parts.count == 2:
             // Fills a private pasteboard (never the user's clipboard) and catches from it.
@@ -1427,7 +1469,7 @@ final class DisplayLinkProxy: NSObject {
     init(view: NSView?, callback: @escaping () -> Void) {
         self.callback = callback
         super.init()
-        guard let view else { rate = 0; setRate(10); return }
+        guard let view else { rate = 0; setRate(OverlayController.restRate); return }
         link = view.displayLink(target:self,selector:#selector(step(_:)))
         link?.preferredFrameRateRange = CAFrameRateRange(minimum:60,maximum:120,preferred:120)
         link?.add(to:.main,forMode:.common)
@@ -1450,11 +1492,11 @@ final class DisplayLinkProxy: NSObject {
         }
         if fps <= 10 {
             link?.isPaused = true
-            if idleTimer == nil {
-                idleTimer = Timer(timeInterval:1/Double(fps),repeats:true) { [weak self] _ in self?.callback() }
-                idleTimer?.tolerance = 0.02
-                RunLoop.main.add(idleTimer!,forMode:.common)
-            }
+            idleTimer?.invalidate()
+            idleTimer = Timer(timeInterval:1/Double(fps),repeats:true) { [weak self] _ in self?.callback() }
+            // Generous tolerance lets macOS fold these wakeups into ones it is doing anyway.
+            idleTimer?.tolerance = 0.06
+            if let idleTimer { RunLoop.main.add(idleTimer,forMode:.common) }
         } else {
             idleTimer?.invalidate(); idleTimer = nil
             link?.preferredFrameRateRange = CAFrameRateRange(minimum:min(fps,30),maximum:fps,preferred:fps)
@@ -1462,39 +1504,6 @@ final class DisplayLinkProxy: NSObject {
         }
     }
     func invalidate() { link?.invalidate(); link = nil; idleTimer?.invalidate(); idleTimer = nil }
-}
-
-/// Applies the latest submitted pose on SceneKit's render thread, inside its own update pass.
-final class SpiderRenderBridge: NSObject, SCNSceneRendererDelegate {
-    private var renderer: SpiderRenderer
-    private let lock = NSLock()
-    /// Swap in a different spider; applied on the render thread with the next frame.
-    func replaceRenderer(_ next: SpiderRenderer) { lock.lock(); renderer = next; lock.unlock() }
-    private var pending: SpiderPoseSnapshot?
-    init(renderer: SpiderRenderer) { self.renderer = renderer }
-    func submit(_ pose: SpiderPoseSnapshot) { lock.lock(); pending = pose; lock.unlock() }
-    private var pendingCamera: (V3,Double,SCNMatrix4?)?
-    /// Camera changes are applied on the render thread too, in the same pass as the next pose.
-    func setCamera(position: V3, scale: Double, projection: SCNMatrix4? = nil) { lock.lock(); pendingCamera = (position,scale,projection); lock.unlock() }
-    /// Development stats: rendered frames that applied a new pose, and the longest gap between them.
-    private(set) var applied = 0, longestApplyGap = 0.0
-    private var lastApply = 0.0
-    func resetStats() { lock.lock(); applied = 0; longestApplyGap = 0; lastApply = 0; lock.unlock() }
-    func renderer(_ sceneRenderer: SCNSceneRenderer, updateAtTime time: TimeInterval) {
-        lock.lock(); let pose = pending; pending = nil; let camera = pendingCamera; pendingCamera = nil; lock.unlock()
-        if let camera {
-            renderer.camera.simdPosition = camera.0; renderer.camera.camera?.orthographicScale = camera.1
-            if let projection = camera.2 { renderer.camera.camera?.projectionTransform = projection }
-        }
-        guard let pose else { return }
-        let start = CACurrentMediaTime()
-        renderer.render(pose)
-        lock.lock()
-        applied += 1
-        if lastApply > 0 { longestApplyGap = max(longestApplyGap,start-lastApply) }
-        lastApply = start
-        lock.unlock()
-    }
 }
 
 /// The Nest's glass pane: swallows clicks inside the Nest (they must never reach the app underneath)

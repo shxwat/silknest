@@ -43,7 +43,7 @@ Nest spreads out with everything you copied; pick something and it is pasted whe
   for more; notes are found by Nest search too.
 - **A spider with moods** — it glows red on the hunt, turns silver-blue and looks away from secrets,
   follows your pointer, wiggles after a burst of copies and dozes on a thread when you leave it alone.
-  Every animation respects Reduce Motion, and it rests at about 2% CPU.
+  Every animation respects Reduce Motion, and it rests at about 1% CPU.
 - **Small extras** — transforms (UPPERCASE, Trim, One Line, Pretty JSON, URL Decode), drag items out to
   any app, drop files on the spider, uninstall from Settings.
 

@@ -30,18 +30,17 @@ final class SpiderRenderer {
     let camera = SCNNode()
     var debugOptions: SpiderDebugOptions = []
     let debug: SpiderDebugRenderer?
-    private var legs: [[SCNNode]] = [], joints: [[SCNNode]] = []
+    private var legs: [[SCNNode]] = []
     private var palps: [[SCNNode]] = [], fangs: [SCNNode] = []
     private var contacts: [SCNNode] = []
     private lazy var legPoses = legs.map { $0.map(SpiderNodePose.init) }
-    private lazy var jointPoses = joints.map { $0.map(SpiderNodePose.init) }
+    private var legMesh: SpiderGeometry.LegMesh?
+    private var legSegments: [(V3,V3,Float)] = []
     private lazy var palpPoses = palps.map { $0.map(SpiderNodePose.init) }
     private lazy var contactPoses = contacts.map(SpiderNodePose.init)
     private var appliedScale: Float?
     private let limbHair = SCNNode(), shadow = SCNNode(), parcel = SCNNode(), silkShot = SCNNode(), silkWrap = SCNNode()
     private var lastSignature: [Float] = []
-    /// Static limb hairs parented to femur/tibia segments: built once, never reallocated per frame.
-    private var hairsBuilt = Set<Int>()
     /// Neon only: soft glow shells that follow the legs and body.
     private var haloMaterial: SCNMaterial?
     private var cachedWrap: SCNGeometry?
@@ -51,8 +50,10 @@ final class SpiderRenderer {
     var parcelHidden = false
     var parcelImage: NSImage? {
         didSet {
+            guard parcelImage !== oldValue else { return }
             let m = parcel.geometry?.firstMaterial
             m?.diffuse.contents = parcelImage.map { SpiderRenderer.veiled($0) } ?? NSColor(srgbRed:0.19,green:0.19,blue:0.19,alpha:1)
+            forceNextRender()
         }
     }
     private let skin: SCNMaterial, hinge: SCNMaterial, fiber: SCNMaterial, silk: SCNMaterial
@@ -67,7 +68,8 @@ final class SpiderRenderer {
     private var eyeMaterial: SCNMaterial
     private var appliedLock: Float = -1
     /// Eye highlights (they shift toward the pointer: the eyes follow it) with their resting place and eye size.
-    private var glints: [(node: SCNNode, base: V3, size: Float)] = []
+    /// All eight highlights as one mesh (one draw call), slid together toward the pointer.
+    private var glints: (node: SCNNode, base: V3, size: Float)?
     /// Sleep: a thread from the body up off the desk, and the glow dimmed.
     private let sleepThread = SCNNode()
     private var sleep: Float = 0, breath: Float = 0, appliedSleep: Float = -1, appliedBreath: Float = -1
@@ -113,7 +115,7 @@ final class SpiderRenderer {
             abdomen.addChildNode(SpiderGeometry.shellHairs(.abdomen,count:Int(130*species.hairiness),material:fiber,length:min(2.2,species.hairiness)))
         }
         let pedicel = SpiderGeometry.sphere(V3(2.7,4.5,2.3),material:hinge)
-        pedicel.simdPosition = V3(0,-10.5,8); if isSpider { anatomy.addChildNode(pedicel) }
+        pedicel.simdPosition = V3(0,-10.5,8)
         head.isHidden = !isSpider; abdomen.isHidden = !isSpider
         let wet = SpiderGeometry.material(V3(repeating:0.018),roughness:0.22)
         limb = style == .neon || species.leg != species.carapace ? skin.copy() as! SCNMaterial : skin
@@ -121,13 +123,15 @@ final class SpiderRenderer {
             limb.diffuse.contents = NSColor(srgbRed:CGFloat(species.leg.x),green:CGFloat(species.leg.y),blue:CGFloat(species.leg.z),alpha:1)
         }
         eyeMaterial = style == .neon ? wet.copy() as! SCNMaterial : wet
+        // Rigid parts of the head and body are merged into a few meshes: fewer draw calls every frame.
+        let eyes = SCNNode(), rigid = SCNNode(), fangParts = SCNNode()
         for (i,(x,y,r)) in [(-2.4,14.8,1.15),(2.4,14.8,1.15),(-5.1,13.3,0.7),(5.1,13.3,0.7),(-6.8,10.4,0.6),(6.8,10.4,0.6),(-3.7,16.2,0.6),(3.7,16.2,0.6)].enumerated() {
             // Front median eyes scale per species (a jumping spider's are enormous and face forward).
             let k: Float = i < 2 ? species.frontEyes : 1
             let size = Float(r)*k
             let eye = SpiderGeometry.sphere(V3(size,size*0.8,size*(k > 1.5 ? 0.9 : 0.65)),material:eyeMaterial)
             eye.simdPosition = V3(Float(x)*(i < 2 ? max(1,k*0.75) : 1),Float(y)+(i < 2 && k > 1.5 ? 2.2 : 0),13.5+(i < 2 && k > 1.5 ? 0.8 : 0))
-            if isSpider { anatomy.addChildNode(eye) }
+            if isSpider { eyes.addChildNode(eye) }
         }
         let profiles: [[Float]] = [
             [0.55,0.88,1,0.93,0.65], // coxa / trochanter
@@ -143,11 +147,21 @@ final class SpiderRenderer {
             bandMaterial = limb.copy() as! SCNMaterial
             bandMaterial.diffuse.contents = NSColor(srgbRed:CGFloat(band.x),green:CGFloat(band.y),blue:CGFloat(band.z),alpha:1)
         } else { bandMaterial = limb }
-        let templates = profiles.enumerated().map { SpiderGeometry.limb(profile:$0.element,bend:$0.offset==1 ? 0.12 : 0.04,material:$0.offset == 2 ? bandMaterial : limb) }
-        legs = (0..<8).map { _ in templates.map { SCNNode(geometry:$0) } }
-        let jointGeometry = SCNSphere(radius:1); jointGeometry.segmentCount = 12; jointGeometry.materials = [hinge]
-        joints = (0..<8).map { _ in (0..<5).map { _ in SCNNode(geometry:jointGeometry) } }
-        for nodes in legs+joints { for node in nodes { scene.rootNode.addChildNode(node) } }
+        // Each segment is one mesh with its own setae and spines (one draw call); its articulation is drawn
+        // by the limb shader as a dark band, so no separate joint spheres are needed.
+        let nominal: [(radius: Float, length: Float, setae: Int, spines: Int)] = [(2.8,4.5,0,0),(2.55,35,44,6),(2.1,6,10,0),(1.6,23,36,5),(0.85,15,24,3),(0.43,4,6,0)]
+        let hair = species.hairiness
+        let templates = profiles.enumerated().map { (i,profile) in
+            SpiderGeometry.limbDetailed(profile:profile,bend:i==1 ? 0.12 : 0.04,radius:nominal[i].radius*species.legThickness,length:nominal[i].length,
+                                        setae:Int(Float(nominal[i].setae)*hair),spines:Int(Float(nominal[i].spines)*hair),seed:i*31+7,material:i == 2 ? bandMaterial : limb)
+        }
+        // One mesh draws all 48 segments (see LegMesh); the per-segment nodes are only a fallback.
+        if let mesh = SpiderGeometry.LegMesh(templates:templates,legs:8,materials:[limb,bandMaterial],materialOf:{ $0 == 2 && bandMaterial !== limb ? 1 : 0 }) {
+            legMesh = mesh; scene.rootNode.addChildNode(mesh.node)
+        } else {
+            legs = (0..<8).map { _ in templates.map { SCNNode(geometry:$0) } }
+            for nodes in legs { for node in nodes { scene.rootNode.addChildNode(node) } }
+        }
         scene.rootNode.addChildNode(limbHair)
         if style == .neon {
             let halo = SCNMaterial(); halo.lightingModel = .constant
@@ -164,13 +178,17 @@ final class SpiderRenderer {
         }
         for side: Float in [-1,1] where isSpider {
             let chelicera = SpiderGeometry.sphere(V3(2.5,3.5,2.6),material:hinge)
-            chelicera.simdPosition = V3(side*2.8,17,7.5); anatomy.addChildNode(chelicera)
+            chelicera.simdPosition = V3(side*2.8,17,7.5); rigid.addChildNode(chelicera)
             let fang = SCNNode(geometry:SpiderGeometry.curve([V3(side*3,19,7),V3(side*3.5,22,5.5),V3(side*1.2,23.5,4.2)],radius:0.48,material:wet))
-            anatomy.addChildNode(fang); fangs.append(fang)
+            fangParts.addChildNode(fang)
             let palpNodes = (0..<3).map { _ in SCNNode(geometry:templates[4]) }
             for p in palpNodes { anatomy.addChildNode(p) }; palps.append(palpNodes)
             let spinneret = SpiderGeometry.sphere(V3(1.1,2.5,1.1),material:hinge)
-            spinneret.simdPosition = V3(side*2,-47.2,7); anatomy.addChildNode(spinneret)
+            spinneret.simdPosition = V3(side*2,-47.2,7); rigid.addChildNode(spinneret)
+        }
+        if isSpider {
+            rigid.addChildNode(pedicel)
+            for group in [rigid,fangParts] { let merged = group.flattenedClone(); anatomy.addChildNode(merged); fangs.append(merged) }
         }
         let texture = SpiderGeometry.shadowTexture()
         func shadowNode(size: CGSize) -> SCNNode {
@@ -190,6 +208,10 @@ final class SpiderRenderer {
         parcel.simdScale = V3(repeating:4)
         anatomy.addChildNode(parcel); anatomy.addChildNode(silkShot); anatomy.addChildNode(silkWrap)
         scene.rootNode.addChildNode(sleepThread); sleepThread.isHidden = true
+        // Real (hidden) geometry from the start, so warming up the renderer compiles every pipeline the
+        // catch and sleep will need; nothing is compiled mid-animation.
+        let stub = SpiderGeometry.curve([V3(0,0,0),V3(0,1,0),V3(0,2,0)],radius:0.1,material:silk)
+        silkShot.geometry = stub; silkWrap.geometry = stub; sleepThread.geometry = stub
         parcel.isHidden = true; silkShot.isHidden = true; silkWrap.isHidden = true
         camera.camera = SCNCamera()
         camera.camera?.usesOrthographicProjection = true
@@ -206,26 +228,46 @@ final class SpiderRenderer {
             neonMaterials = [(limb,0.62),(fiber,0.3),(hinge,0.7),(skin,0.0),(abdomenSkin,0.0)]
             for (m,_) in neonMaterials { m.shaderModifiers = [.fragment:Self.rimShader] }
             abdomenSkin.shaderModifiers = [.fragment:Self.abdomenShader]; abdomenGlow = abdomenSkin
-            // Smooth glossy shell (no grainy normal or roughness texture).
-            for m in [skin,abdomenSkin] {
-                m.normal.contents = nil; m.roughness.contents = 0.32
-                m.clearCoat.contents = 1.0; m.clearCoatRoughness.contents = 0.06
+            // Real cuticle, not plastic: a lacquered shell with fine pits (carapace) and a velvet of tiny hairs
+            // under the gloss (abdomen); a clear coat keeps the sharp highlights.
+            let plates = SpiderGeometry.cuticle(velvet:false), velvet = SpiderGeometry.cuticle(velvet:true)
+            for (m,detail) in [(skin,plates),(abdomenSkin,velvet)] {
+                m.normal.contents = detail.normal; m.normal.intensity = m === skin ? 0.28 : 0.32
+                m.normal.wrapS = .repeat; m.normal.wrapT = .repeat
+                m.normal.contentsTransform = SCNMatrix4MakeScale(m === skin ? 2 : 4,m === skin ? 2 : 2,1)
+                m.roughness.contents = detail.roughness; m.roughness.wrapS = .repeat; m.roughness.wrapT = .repeat
+                m.roughness.contentsTransform = m.normal.contentsTransform
+                m.clearCoat.contents = 0.85; m.clearCoatRoughness.contents = 0.11
+                m.clearCoatNormal.contents = nil
             }
+            // Legs: fine cuticle streaks; the limb shader adds the joint bands and the rim.
+            limb.diffuse.contents = SpiderGeometry.legTexture(tint:species.leg)
+            limb.diffuse.wrapS = .repeat; limb.diffuse.wrapT = .clamp
+            limb.roughness.contents = 0.48
+            limb.shaderModifiers = [.fragment:Self.limbShader]
+            // Eyes: glassy domes that mirror the room.
+            eyeMaterial.clearCoat.contents = 1.0; eyeMaterial.clearCoatRoughness.contents = 0.02; eyeMaterial.roughness.contents = 0.12
             // Eyes: deep red, each with a bright specular dot.
             let glint = SCNMaterial(); glint.lightingModel = .constant; glint.diffuse.contents = NSColor.white
-            for node in anatomy.childNodes where node.geometry?.firstMaterial === eyeMaterial {
+            let highlights = SCNNode(); var sizes: Float = 0
+            for node in eyes.childNodes {
                 let s = node.simdScale.x
                 let g = SpiderGeometry.sphere(V3(repeating:max(0.2,s*0.26)),material:glint)
                 g.simdPosition = node.simdPosition+V3(-s*0.3,s*0.3,s*0.6)
-                anatomy.addChildNode(g)
-                glints.append((g,g.simdPosition,s))
+                highlights.addChildNode(g); sizes += s
             }
-            limb.diffuse.contents = NSColor(srgbRed:CGFloat(species.leg.x),green:CGFloat(species.leg.y),blue:CGFloat(species.leg.z),alpha:1)
+            let merged = highlights.flattenedClone()
+            anatomy.addChildNode(merged)
+            glints = (merged,merged.simdPosition,sizes/Float(max(1,highlights.childNodes.count)))
             skin.diffuse.contents = NSColor(srgbRed:CGFloat(species.carapace.x),green:CGFloat(species.carapace.y),blue:CGFloat(species.carapace.z),alpha:1)
             abdomenSkin.diffuse.contents = NSColor(srgbRed:CGFloat(species.abdomen.x),green:CGFloat(species.abdomen.y),blue:CGFloat(species.abdomen.z),alpha:1)
             applyLock()
         }
-        light(type:.ambient,intensity:220,color:V3(0.92,0.94,1),angles:.zero)
+        if isSpider { anatomy.addChildNode(eyes.flattenedClone()) }
+        // Soft studio reflections (image-based light); the direct lights are trimmed to keep the same exposure.
+        scene.lightingEnvironment.contents = SpiderGeometry.studioEnvironment()
+        scene.lightingEnvironment.intensity = 0.9
+        light(type:.ambient,intensity:110,color:V3(0.92,0.94,1),angles:.zero)
         light(type:.directional,intensity:950,color:V3(1,0.96,0.9),angles:V3(-0.55,-0.65,-0.2))
         light(type:.directional,intensity:330,color:V3(0.83,0.9,1),angles:V3(0.7,1.1,1.4))
         // Low grazing light: catches leg segments and the shell rim, so the body reads as volume on any desktop.
@@ -253,7 +295,7 @@ final class SpiderRenderer {
         render(motion); return true
     }
     func render(_ motion: SpiderPose) {
-        SCNTransaction.begin(); SCNTransaction.animationDuration = 0
+        SCNTransaction.begin(); SCNTransaction.animationDuration = 0; SCNTransaction.disableActions = true
         sleep = motion.sleepAmount; breath = motion.glowBreath
         if style == .neon && (abs(lock-appliedLock) > 0.01 || abs(shield-appliedShield) > 0.01 || abs(sleep-appliedSleep) > 0.01 || abs(breath-appliedBreath) > 0.01) { applyLock() }
         // The eyes follow the pointer: highlights slide toward it.
@@ -261,7 +303,7 @@ final class SpiderRenderer {
             let d = rotate(g-motion.position,-motion.heading); let l = simd_length(V3(d.x,d.y,0))
             return l > 1 ? V3(d.x/l,d.y/l,0) : .zero
         } ?? .zero
-        for g in glints { g.node.simdPosition = g.base+look*g.size*0.32 }
+        if let g = glints { g.node.simdPosition = g.base+look*g.size*0.32 }
         // Asleep: hanging from a thread that rises off the desk.
         sleepThread.isHidden = motion.sleepAmount < 0.02
         if !sleepThread.isHidden {
@@ -278,24 +320,17 @@ final class SpiderRenderer {
         var poses: [LegPose] = []
         let needsDebugPoses = debug != nil && motion is SpiderMotion
         let radii: [Float] = [2.8,2.55,2.1,1.6,0.85,0.43].map { $0*legRadius*k }
+        legSegments.removeAll(keepingCapacity:true)
         for (i,foot) in motion.feet.enumerated() {
             let pose = LegPose.solve(foot,motion:motion)
             if needsDebugPoses { poses.append(pose) }
-            for j in 0..<6 { legPoses[i][j].connect(pose.points[j],pose.points[j+1],radius:radii[j]) }
-            for j in (species.hairiness > 1.5 ? [1,2,3,4] : (species.hairiness > 0.05 ? [1,3] : [])) where !hairsBuilt.contains(i*8+j) {
-                hairsBuilt.insert(i*8+j)
-                legs[i][j].addChildNode(Self.segmentHairs(count:Int(Float(j == 1 ? 5 : 4)*species.hairiness),reach:min(2.4,species.hairiness),radius:radii[j],length:simd_distance(pose.points[j],pose.points[j+1]),seed:i*8+j,material:fiber))
-            }
-            for j in 0..<5 {
-                jointPoses[i][j].move(pose.points[j+1])
-                let r: Float = [1.65,1.55,1.1,0.65,0.26][j]*legRadius*k
-                jointPoses[i][j].resize(V3(r,r*0.72,r*0.80))
-                jointPoses[i][j].orient(legs[i][j+1].simdOrientation)
-            }
+            if legMesh != nil { for j in 0..<6 { legSegments.append((pose.points[j],pose.points[j+1],radii[j])) } }
+            else { for j in 0..<6 { legPoses[i][j].connect(pose.points[j],pose.points[j+1],radius:radii[j]) } }
             contactPoses[i].move(V3(foot.position.x,foot.position.y,0.1))
             contactPoses[i].resize(V3(repeating:k))
             contactPoses[i].fade(CGFloat((1-clamp(foot.position.z/6))*0.8))
         }
+        legMesh?.update(legSegments)
         let t = motion.state == .catching ? motion.catchTime : 0
         let grip = smooth((t-0.23)/0.13)*(1-smooth((t-1.03)/0.2))
         // Palps are mostly still; one restrained motion every thirteen seconds, or an actual grab.
@@ -415,6 +450,20 @@ final class SpiderRenderer {
         }
         return SCNNode(geometry:SpiderGeometry.hairs(fibers,material:material))
     }
+    /// Legs: rim light like the other glowing parts, then the articulation: a dark band at each segment's tip end
+    /// (v → 1, also the spines), a lighter membrane at its body end (v → 0).
+    static let limbShader = """
+    #pragma arguments
+    float3 rimColor;
+    float rimPower;
+    #pragma body
+    float v = _surface.diffuseTexcoord.y;
+    float band = smoothstep(0.82, 0.965, v);
+    float membrane = 1.0 - smoothstep(0.0, 0.09, v);
+    float facing = clamp(dot(normalize(_surface.normal), normalize(float3(0.0, -0.42, 0.91))), 0.0, 1.0);
+    _output.color.rgb += rimColor * pow(1.0 - facing, rimPower);
+    _output.color.rgb *= 1.0 - 0.74 * band - 0.28 * membrane;
+    """
     /// The abdomen: gold rim, plus the hunt glow rising inside it while catching (`inner` 0 at rest).
     static let abdomenShader = """
     #pragma arguments

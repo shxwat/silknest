@@ -1,5 +1,17 @@
 # Changelog
 
+## 1.3.2
+
+**A realistic spider, 66% less CPU while it hunts**
+- Same golden spider, same glow, same behaviour. It just looks real now: jointed legs with dark articulations and fine hairs and spines, a lacquered, finely pitted shell, a velvet abdomen, glassy eyes and soft natural reflections.
+- It also does far less work. Measured with the same scenario for both versions (median of 3 runs):
+  - Resting: 2.15% → 1.00% CPU (−53%)
+  - Walking: 6.1% → 4.8% CPU (−21%)
+  - Catching: 20.7% → 7.0% CPU (−66%)
+  - Just after catching: 9.3% → 2.2% CPU (−77%)
+  - Memory while walking: 206 MB → 111 MB (−46%)
+- How: the spider is now drawn only when it actually moves, with no display link running while it rests. Its whole set of legs is a single mesh. A walking spider no longer needs a full-screen drawing surface. The closed Nest no longer runs in the background.
+
 ## 1.3.1
 
 **Exclude apps**

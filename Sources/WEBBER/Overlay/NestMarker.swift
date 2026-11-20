@@ -45,23 +45,30 @@ final class NestMarkerView: NSView {
     var count = 0 { didSet { needsDisplay = true } }
     static let knotPoint = CGPoint(x:84,y:58)
     let knot = NestMarkerView.knotPoint
-    private var swing: CGFloat = 0
-    private var swingStart: CFTimeInterval = 0
-    private var timer: Timer?
+    private let swing: CGFloat = 0
 
     override var isOpaque: Bool { false }
 
+    /// A new catch sets the corner web trembling: a damped sway animated by Core Animation (drawn by the
+    /// render server, so it costs SilkNest no CPU), instead of redrawing the web 60 times a second.
     func bump() {
-        swingStart = CACurrentMediaTime(); swing = 1
-        timer?.invalidate()
-        timer = Timer(timeInterval:1/60,repeats:true) { [weak self] t in
-            guard let self else { t.invalidate(); return }
-            let age = CACurrentMediaTime()-self.swingStart
-            self.swing = CGFloat(exp(-age*4.5)*cos(age*15))
-            self.needsDisplay = true
-            if age > 1.2 { self.swing = 0; t.invalidate() }
+        needsDisplay = true
+        guard !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion else { return }
+        wantsLayer = true
+        guard let layer else { return }
+        // Sway around the screen corner the web is anchored in.
+        let corner = CGPoint(x:bounds.maxX,y:bounds.minY)
+        if layer.anchorPoint != CGPoint(x:1,y:0) {
+            layer.anchorPoint = CGPoint(x:1,y:0); layer.position = corner
         }
-        RunLoop.main.add(timer!,forMode:.common)
+        let sway = CAKeyframeAnimation(keyPath:"transform.rotation.z")
+        let steps = 24
+        sway.values = (0...steps).map { i -> Double in let t = Double(i)/Double(steps)*1.2; return exp(-t*4.5)*cos(t*15)*0.035 }
+        sway.duration = 1.2; sway.calculationMode = .linear
+        let pop = CAKeyframeAnimation(keyPath:"transform.scale")
+        pop.values = (0...steps).map { i -> Double in let t = Double(i)/Double(steps)*1.2; return 1+abs(exp(-t*4.5)*cos(t*15))*0.04 }
+        pop.duration = 1.2
+        layer.add(sway,forKey:"sway"); layer.add(pop,forKey:"pop")
     }
 
     override func draw(_ dirtyRect: NSRect) {
